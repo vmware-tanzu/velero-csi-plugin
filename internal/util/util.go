@@ -30,6 +30,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -122,13 +123,13 @@ func IsPVCDefaultToFSBackup(pvcNamespace, pvcName string, podClient corev1client
 
 	return false, nil
 }
-func GetVolumeSnapshotClass(provisioner string, backup *velerov1api.Backup, pvc *corev1api.PersistentVolumeClaim, log logrus.FieldLogger, snapshotClient snapshotter.SnapshotV1Interface) (*snapshotv1api.VolumeSnapshotClass, error) {
+func GetVolumeSnapshotClass(storageClass *storagev1.StorageClass, backup *velerov1api.Backup, pvc *corev1api.PersistentVolumeClaim, log logrus.FieldLogger, snapshotClient snapshotter.SnapshotV1Interface) (*snapshotv1api.VolumeSnapshotClass, error) {
 	snapshotClasses, err := snapshotClient.VolumeSnapshotClasses().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error listing volumesnapshot classes")
 	}
 	// If a snapshot class is sent for provider in PVC annotations, use that
-	snapshotClass, err := GetVolumeSnapshotClassFromPVCAnnotationsForDriver(pvc, provisioner, snapshotClasses)
+	snapshotClass, err := GetVolumeSnapshotClassFromPVCAnnotationsForDriver(pvc, storageClass.Provisioner, snapshotClasses)
 	if err != nil {
 		log.Debugf("Didn't find VolumeSnapshotClass from PVC annotations: %v", err)
 	}
@@ -136,8 +137,17 @@ func GetVolumeSnapshotClass(provisioner string, backup *velerov1api.Backup, pvc 
 		return snapshotClass, nil
 	}
 
-	// If there is no annotation in PVC, attempt to fetch it from backup annotations
-	snapshotClass, err = GetVolumeSnapshotClassFromBackupAnnotationsForDriver(backup, provisioner, snapshotClasses)
+	// If there is no annotation in PVC, attempt to fetch it from storageClass annotations
+	snapshotClass, err = GetVolumeSnapshotClassFromStorageClassAnnotationsForDriver(storageClass, snapshotClasses)
+	if err != nil {
+		log.Debugf("Didn't find VolumeSnapshotClass from StorageClass annotations: %v", err)
+	}
+	if snapshotClass != nil {
+		return snapshotClass, nil
+	}
+
+	// If there is no annotation in storageClass, attempt to fetch it from backup annotations
+	snapshotClass, err = GetVolumeSnapshotClassFromBackupAnnotationsForDriver(backup, storageClass.Provisioner, snapshotClasses)
 	if err != nil {
 		log.Debugf("Didn't find VolumeSnapshotClass from Backup annotations: %v", err)
 	}
@@ -146,12 +156,29 @@ func GetVolumeSnapshotClass(provisioner string, backup *velerov1api.Backup, pvc 
 	}
 
 	// fallback to default behaviour of fetching snapshot class based on label
-	snapshotClass, err = GetVolumeSnapshotClassForStorageClass(provisioner, snapshotClasses)
+	snapshotClass, err = GetVolumeSnapshotClassForStorageClass(storageClass.Provisioner, snapshotClasses)
 	if err != nil || snapshotClass == nil {
 		return nil, errors.Wrap(err, "error getting volumesnapshotclass")
 	}
 
 	return snapshotClass, nil
+}
+
+func GetVolumeSnapshotClassFromStorageClassAnnotationsForDriver(storageClass *storagev1.StorageClass, snapshotClasses *snapshotv1api.VolumeSnapshotClassList) (*snapshotv1api.VolumeSnapshotClass, error) {
+	annotationKey := VolumeSnapshotClassDriverStorageClassAnnotation
+	snapshotClassName, ok := storageClass.ObjectMeta.Annotations[annotationKey]
+	if !ok {
+		return nil, nil
+	}
+	for _, sc := range snapshotClasses.Items {
+		if strings.EqualFold(snapshotClassName, sc.ObjectMeta.Name) {
+			if !strings.EqualFold(sc.Driver, storageClass.Provisioner) {
+				return nil, errors.Errorf("Incorrect volumesnapshotclass, snapshot class %s is not for driver %s", sc.ObjectMeta.Name, storageClass.Provisioner)
+			}
+			return &sc, nil
+		}
+	}
+	return nil, errors.Errorf("No CSI VolumeSnapshotClass found with name %s for provisioner %s for StorageClass %s", snapshotClassName, storageClass.Provisioner, storageClass.Name)
 }
 
 func GetVolumeSnapshotClassFromPVCAnnotationsForDriver(pvc *corev1api.PersistentVolumeClaim, provisioner string, snapshotClasses *snapshotv1api.VolumeSnapshotClassList) (*snapshotv1api.VolumeSnapshotClass, error) {
